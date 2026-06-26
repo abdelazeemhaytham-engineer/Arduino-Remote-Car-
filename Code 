@@ -1,0 +1,268 @@
+/*
+ * Arduino Smart Car Remote Control
+ *
+ * Hardware:
+ * - L298N Motor Driver (IN1–IN4) controlling two REAR wheels independently
+ * - Front single 360° roller wheel (passive, no motor)
+ * - 5-Way Navigation Joystick (Active LOW via COM to GND)
+ * - HC-SR04 Ultrasonic Sensor — forward obstacle detection only
+ * - LDR Light Sensor — automatic front headlights
+ * - ON/OFF Power Switch
+ *
+ * Joystick Behaviour:
+ *   UP    → Both rear motors forward
+ *   DOWN  → Both rear motors backward
+ *   LEFT  → Left tyre motor only (car drifts left)
+ *   RIGHT → Right tyre motor only (car drifts right)
+ *   CENTER (neutral) → Both motors OFF
+ *
+ * Obstacle Safety:
+ *   - Only blocks FORWARD movement (reverse still allowed to escape)
+ *   - Buzzer ON continuously while obstacle present
+ *   - Obstacle LED blinks while obstacle present
+ *
+ * Headlights:
+ *   - Fully independent of all motor/joystick logic
+ *   - Controlled ONLY by LDR reading vs darkness threshold
+ *
+ * Power Switch:
+ *   - When switch is OPEN (HIGH via pull-up): everything OFF
+ *   - When switch is CLOSED (LOW): car is active
+ */
+
+// ── PIN DEFINITIONS ────────────────────────────────────────────────────────────
+
+// L298N Motor Driver — Rear Left and Rear Right wheels
+const int IN1 = 2;   // Left Motor  — Forward
+const int IN2 = 3;   // Left Motor  — Backward
+const int IN3 = 4;   // Right Motor — Forward
+const int IN4 = 5;   // Right Motor — Backward
+
+// HC-SR04 Ultrasonic Sensor
+const int TRIG_PIN = 7;
+const int ECHO_PIN = 8;
+
+// Safety Alert Outputs
+const int BUZZER_PIN    = 9;   // Moved from 10 to avoid PWM conflict
+const int OBSTACLE_LED  = 10;
+
+// Automatic Front Headlights
+const int HEADLIGHTS_PIN = 6;  // Moved to pin 6 — fully separate from all other logic
+
+// ON/OFF Power Switch (connect between pin and GND; uses internal pull-up)
+const int POWER_SWITCH_PIN = 13;
+
+// 5-Way Joystick Pins (analog pins used as digital INPUT_PULLUP)
+const int JOY_UP  = A0;   // Both motors forward
+const int JOY_DWN = A1;   // Both motors backward
+const int JOY_LFT = A3;   // Left tyre motor only
+const int JOY_RHT = A4;   // Right tyre motor only
+
+// LDR Light Sensor
+const int LDR_PIN = A2;   // Kept on A2 — separate from all joystick pins
+
+// ── CALIBRATION CONSTANTS ──────────────────────────────────────────────────────
+
+const int  OBSTACLE_THRESHOLD_CM = 20;   // Block forward movement within 20 cm
+const int  DARKNESS_THRESHOLD    = 400;  // Headlights ON when LDR reads below this
+const long BLINK_INTERVAL_MS     = 200;  // LED blink period in milliseconds
+
+// ── STATE VARIABLES ────────────────────────────────────────────────────────────
+
+unsigned long previousBlinkMillis = 0;
+bool warningLedState = LOW;
+
+// ── SETUP ──────────────────────────────────────────────────────────────────────
+
+void setup() {
+  // Motor driver outputs
+  pinMode(IN1, OUTPUT);
+  pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT);
+  pinMode(IN4, OUTPUT);
+
+  // Ultrasonic sensor
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Safety alert outputs
+  pinMode(BUZZER_PIN,   OUTPUT);
+  pinMode(OBSTACLE_LED, OUTPUT);
+
+  // Headlight output — independent pin, never touched by motor logic
+  pinMode(HEADLIGHTS_PIN, OUTPUT);
+
+  // Joystick — active LOW (pressing connects to GND through COM)
+  pinMode(JOY_UP,  INPUT_PULLUP);
+  pinMode(JOY_DWN, INPUT_PULLUP);
+  pinMode(JOY_LFT, INPUT_PULLUP);
+  pinMode(JOY_RHT, INPUT_PULLUP);
+
+  // LDR analog input
+  pinMode(LDR_PIN, INPUT);
+
+  // Power switch — active LOW (closed = car ON)
+  pinMode(POWER_SWITCH_PIN, INPUT_PULLUP);
+
+  // Safe initial state
+  stopMotors();
+  digitalWrite(BUZZER_PIN,    LOW);
+  digitalWrite(OBSTACLE_LED,  LOW);
+  digitalWrite(HEADLIGHTS_PIN, LOW);
+}
+
+// ── MAIN LOOP ──────────────────────────────────────────────────────────────────
+
+void loop() {
+
+  // ── STEP 1: CHECK POWER SWITCH ─────────────────────────────────────────────
+  // If switch is open (HIGH via pull-up) → shut everything down and wait
+  if (digitalRead(POWER_SWITCH_PIN) == HIGH) {
+    stopMotors();
+    disableSafetyAlerts();
+    digitalWrite(HEADLIGHTS_PIN, LOW);
+    delay(50);
+    return; // Skip all logic below until switch is closed
+  }
+
+  // ── STEP 2: AUTOMATIC HEADLIGHTS (LDR only — never affected by motors) ─────
+  // FIX: This block is now completely isolated. It reads LDR and writes
+  // HEADLIGHTS_PIN (pin 6). No motor or joystick code ever touches pin 6.
+  int lightLevel = analogRead(LDR_PIN);
+  if (lightLevel < DARKNESS_THRESHOLD) {
+    digitalWrite(HEADLIGHTS_PIN, HIGH);  // Dark → Headlights ON
+  } else {
+    digitalWrite(HEADLIGHTS_PIN, LOW);   // Bright → Headlights OFF
+  }
+
+  // ── STEP 3: MEASURE DISTANCE ───────────────────────────────────────────────
+  long distance = measureDistance();
+  bool obstacleAhead = (distance > 0 && distance <= OBSTACLE_THRESHOLD_CM);
+
+  // ── STEP 4: READ JOYSTICK ──────────────────────────────────────────────────
+  bool upPressed  = (digitalRead(JOY_UP)  == LOW);
+  bool dwnPressed = (digitalRead(JOY_DWN) == LOW);
+  bool lftPressed = (digitalRead(JOY_LFT) == LOW);
+  bool rhtPressed = (digitalRead(JOY_RHT) == LOW);
+
+  // ── STEP 5: OBSTACLE CHECK — FORWARD ONLY ─────────────────────────────────
+  // FIX: Obstacle only blocks FORWARD movement.
+  // Reverse is still allowed so the car can escape.
+  if (obstacleAhead && upPressed) {
+    stopMotors();
+    executeSafetyAlerts();
+  }
+  else {
+    disableSafetyAlerts();
+
+    // ── STEP 6: MOTOR CONTROL ─────────────────────────────────────────────
+    if (upPressed && !obstacleAhead) {
+      // Both motors forward — car moves straight ahead
+      // FIX: Verified both IN1+IN3 go HIGH for forward on each side
+      moveForward();
+    }
+    else if (dwnPressed) {
+      // Both motors backward — reverse always allowed
+      moveBackward();
+    }
+    else if (lftPressed) {
+      // FIX: Left tyre only — car drifts/curves left
+      // (Right motor OFF, Left motor ON forward)
+      leftTyreOnly();
+    }
+    else if (rhtPressed) {
+      // FIX: Right tyre only — car drifts/curves right
+      // (Left motor OFF, Right motor ON forward)
+      rightTyreOnly();
+    }
+    else {
+      // Neutral — no input, both motors stop
+      stopMotors();
+    }
+  }
+
+  delay(30); // Short stabilisation delay
+}
+
+// ── MOTOR CONTROL FUNCTIONS ────────────────────────────────────────────────────
+
+// Both motors forward (straight ahead)
+void moveForward() {
+  digitalWrite(IN1, HIGH);  // Left Motor  → Forward
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);  // Right Motor → Forward
+  digitalWrite(IN4, LOW);
+}
+
+// Both motors backward (straight reverse)
+void moveBackward() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, HIGH);  // Left Motor  → Backward
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, HIGH);  // Right Motor → Backward
+}
+
+// Left tyre motor only — car curves left
+// FIX: Only IN1/IN2 active. IN3/IN4 explicitly off.
+void leftTyreOnly() {
+  digitalWrite(IN1, HIGH);  // Left Motor  → Forward
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);   // Right Motor → OFF
+  digitalWrite(IN4, LOW);
+}
+
+// Right tyre motor only — car curves right
+// FIX: Only IN3/IN4 active. IN1/IN2 explicitly off.
+void rightTyreOnly() {
+  digitalWrite(IN1, LOW);   // Left Motor  → OFF
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH);  // Right Motor → Forward
+  digitalWrite(IN4, LOW);
+}
+
+// Full stop — all motor pins LOW
+void stopMotors() {
+  digitalWrite(IN1, LOW);
+  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);
+  digitalWrite(IN4, LOW);
+}
+
+// ── ULTRASONIC SENSOR ──────────────────────────────────────────────────────────
+
+long measureDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // 30ms timeout — if no echo returns, treat path as clear
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return 999;
+
+  // Distance (cm) = duration × speed of sound (0.0343 cm/µs) ÷ 2 (round trip)
+  return duration * 0.0343 / 2;
+}
+
+// ── SAFETY ALERT FUNCTIONS ─────────────────────────────────────────────────────
+
+// Continuous buzzer + non-blocking blinking LED
+void executeSafetyAlerts() {
+  digitalWrite(BUZZER_PIN, HIGH); // Steady buzzer tone
+
+  // Non-blocking LED blink using millis()
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousBlinkMillis >= BLINK_INTERVAL_MS) {
+    previousBlinkMillis = currentMillis;
+    warningLedState = !warningLedState;
+    digitalWrite(OBSTACLE_LED, warningLedState);
+  }
+}
+
+// Reset all alert outputs to OFF
+void disableSafetyAlerts() {
+  digitalWrite(BUZZER_PIN,   LOW);
+  digitalWrite(OBSTACLE_LED, LOW);
+  warningLedState = LOW; // Reset blink state so next alert starts fresh
+}
